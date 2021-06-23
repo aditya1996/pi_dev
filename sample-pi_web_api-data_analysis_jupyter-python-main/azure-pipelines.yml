@@ -1,0 +1,149 @@
+trigger:
+  batch: true
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+schedules:
+  - cron: '0 0 * * 0'
+    displayName: Weekly build
+    branches:
+      include:
+        - main
+    always: true
+
+resources:
+  repositories:
+    - repository: templates
+      type: github
+      name: osisoft/OSI-Samples
+      endpoint: osisoft/OSI-Samples
+
+variables:
+  - template: '/miscellaneous/build_templates/variables.yml@templates'
+  - name: CredFile
+    value: test_config.json
+  - name: CredFileLibrary
+    value: product-readiness.piwebapi_python.json
+  - name: analysisProject
+    value: PIWebAPI_Data_Analysis
+
+jobs:
+  - job: BuildUploadUtility
+    pool:
+      name: 00-OSIManaged-Test
+      demands: COMPUTERNAME -equals $(buildAgent)
+    steps:
+      - template: '/miscellaneous/build_templates/config.yml@templates'
+        parameters:
+          fileOriginal: $(CredFile)
+          fileLibrary: $(CredFileLibrary)
+
+      - task: DotNetCoreCLI@2
+        displayName: Restore
+        inputs:
+          command: 'restore'
+          projects: '**/UploadUtility.csproj'
+          feedsToUse: 'select'
+
+      - task: DotNetCoreCLI@2
+        displayName: Build
+        inputs:
+          command: 'build'
+          projects: '**/UploadUtility.csproj'
+
+      - task: CopyFiles@2
+        displayName: Copy Build Output Files
+        inputs:
+          sourceFolder: '$(Build.SourcesDirectory)'
+          targetFolder: '$(Build.BinariesDirectory)'
+          contents: '**/bin/Debug/net*/*'
+          overWrite: true
+          flattenFolders: true
+
+      - task: PublishBuildArtifacts@1
+        displayName: Publish Build Output Files
+        inputs:
+          PathtoPublish: '$(Build.BinariesDirectory)'
+          ArtifactName: 'UploadUtility'
+          publishLocation: 'Container'
+
+      - task: PowerShell@2
+        displayName: Run UploadUtility
+        inputs:
+          targetType: 'inline'
+          script: '&"$(Build.BinariesDirectory)/UploadUtility.exe" "$(Build.SourcesDirectory)/UploadUtility/Building Example.xml" "$(Build.SourcesDirectory)/UploadUtility/tagdefinition.csv" "$(Build.SourcesDirectory)/UploadUtility/pidata.csv" "$(Build.SourcesDirectory)/test_config.json"'
+
+  - job: Analysis_BulkUploadUtility
+    pool:
+      name: 00-OSIManaged-Containers
+      demands: Agent.OS -equals Windows_NT
+    variables:
+      analysisProject: PIWebAPI_Data_Analysis_Upload
+    steps:
+      - task: DotNetCoreCLI@2
+        displayName: 'Build'
+        inputs:
+          command: build
+          projects: '**/UploadUtility.csproj'
+
+      - template: '/miscellaneous/build_templates/binskim.yml@templates'
+
+      - template: '/miscellaneous/build_templates/analysis.yml@templates'
+        parameters:
+          projectPath: '/UploadUtility'
+
+  - job: Tests
+    pool:
+      name: 00-OSIManaged-Test
+      demands: COMPUTERNAME -equals $(buildAgent)
+    dependsOn: BuildUploadUtility
+    steps:
+      - template: '/miscellaneous/build_templates/config.yml@templates'
+        parameters:
+          fileOriginal: $(CredFile)
+          fileLibrary: $(CredFileLibrary)
+
+      - script: |
+          echo Install pip
+          call python -m pip install --upgrade pip
+          echo Install tools
+          call pip install requests
+          call pip install requests_kerberos
+          call pip install unittest
+          call pip install unittest-xml-reporting
+          echo Install requirements
+          call pip install -r requirements.txt
+          echo Run tests
+          call jupyter nbconvert --to script Notebook.ipynb
+          python -m pytest --junitxml=junit/test-results.xml ./Notebook.py
+          echo Complete
+        displayName: 'Run tests'
+
+      - task: PublishTestResults@2
+        inputs:
+          testResultsFiles: '**/test-*.xml'
+          searchFolder: '$(Build.SourcesDirectory)'
+          failTaskOnFailedTests: true
+          testRunTitle: '$(Agent.JobName) on $(Agent.OS)'
+        displayName: 'Publish test results'
+        condition: always()
+
+  - job: Analysis
+    pool:
+      name: 00-OSIManaged-Containers
+      demands: Agent.OS -equals Windows_NT
+    steps:
+      - script: |
+          pip install nbconvert
+          jupyter nbconvert --to script Notebook.ipynb
+
+      - template: '/miscellaneous/build_templates/analysis.yml@templates'
+        parameters:
+          skipPolaris: true
+          useRequirementsTxt: true
